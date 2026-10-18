@@ -1,0 +1,172 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 36000
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore Previous PC Profile Backup
+        run: |
+          git config --global user.name "RDP Auto-Backup Bot"
+          git config --global user.email "actions@github.com"
+
+          try {
+              git fetch origin backup-data
+              git checkout backup-data
+              if (Test-Path "backup_archive/profile_backup.zip") {
+                  Write-Host "Found previous profile backup. Restoring automatically..."
+                  Expand-Archive -Path "backup_archive/profile_backup.zip" -DestinationPath "C:\Users\RDP" -Force
+                  Write-Host "PC profile data restored successfully!"
+              } else {
+                  Write-Host "No previous backup archive found. Starting fresh."
+              }
+          } catch {
+              Write-Host "Starting a brand new session with no prior backups."
+          }
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{ Upper   = [char[]](65..90) Lower   = [char[]](97..122) Number  = [char[]](48..57) Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) }$rawPassword = @()
+          $rawPassword +=$charSet.Upper | Get-Random -Count 4
+          $rawPassword +=$charSet.Lower | Get-Random -Count 4
+          $rawPassword +=$charSet.Number | Get-Random -Count 4
+          $rawPassword +=$charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString$password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile$installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID$tsIP = $null$retries = 0
+          while (-not $tsIP -and$retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName$env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection & Auto-Backup Profile
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          $counter = 0
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Auto-backup daemon running..."
+              
+              # Automatically compress and sync profile files every 15 minutes (3 iterations)
+              if ($counter -eq 3) {
+                  Write-Host "Running automated full profile backup..."
+                  try {
+                      git checkout -B backup-data
+                      if (-not (Test-Path "backup_archive")) {
+                          New-Item -ItemType Directory -Path "backup_archive" -Force
+                      }
+                      
+                      # Automatically compress user profile directory (ignores locked system files)
+                      Compress-Archive -Path "C:\Users\RDP\*" -DestinationPath "backup_archive\profile_backup.zip" -Force -ErrorAction SilentlyContinue
+                      
+                      git add backup_archive/profile_backup.zip
+                      git commit -m "Auto-backup profile: $(Get-Date -UFormat \%Y-\%m-\%d_\%H:\%M:\%S)" 2>$null
+                      git push "https://x-access-token:${env:GITHUB_TOKEN}@github.com/${env:GITHUB_REPOSITORY}.git" backup-data --force 2>$null
+                      Write-Host "Profile backup successfully synced to repository branch 'backup-data'!"
+                  } catch {
+                      Write-Host "Auto-backup warning: $_"
+                  }
+                  $counter = 0
+              }
+              
+              Start-Sleep -Seconds 300
+              $counter++
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Final Profile Backup Before Shutdown
+        if: always()
+        run: |
+          Write-Host "Performing final profile backup before shutdown..."
+          git config --global user.name "RDP Auto-Backup Bot"
+          git config --global user.email "actions@github.com"
+          
+          try {
+              git checkout -B backup-data
+              if (-not (Test-Path "backup_archive")) {
+                  New-Item -ItemType Directory -Path "backup_archive" -Force
+              }
+              
+              Compress-Archive -Path "C:\Users\RDP\*" -DestinationPath "backup_archive\profile_backup.zip" -Force -ErrorAction SilentlyContinue
+              
+              git add backup_archive/profile_backup.zip
+              git commit -m "Final shutdown profile backup: $(Get-Date -UFormat \%Y-\%m-\%d_\%H:\%M:\%S)" 2>$null
+              git push "https://x-access-token:${env:GITHUB_TOKEN}@github.com/${env:GITHUB_REPOSITORY}.git" backup-data --force 2>$null
+              Write-Host "Final backup successfully saved to your repository!"
+          } catch {
+              Write-Host "Final backup failed: $_"
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
