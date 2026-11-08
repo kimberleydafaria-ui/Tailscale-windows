@@ -1,4 +1,4 @@
-name: Bulk macOS ZeroTier Remote Desktop
+name: Bulk macOS M1 ZeroTier Desktop
 
 on:
   workflow_dispatch:
@@ -13,48 +13,42 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Verify Mac Hardware
+      - name: Verify M1 Hardware
         shell: bash
         run: |
-          echo "===== BULK MACOS DESKTOP ====="
+          echo "===== MACOS SYSTEM ====="
           sw_vers
-          echo "Architecture:"
-          uname -m
-          echo "CPU:"
-          sysctl -n hw.ncpu
-          echo "RAM:"
-          sysctl -n hw.memsize
-          echo "Storage:"
+          echo "Architecture: $(uname -m)"
+          echo "CPU: $(sysctl -n hw.ncpu)"
+          echo "RAM: $(sysctl -n hw.memsize)"
           df -h /
 
           if [ "$(uname -m)" != "arm64" ]; then
-            echo "ERROR: ARM64 Mac required"
+            echo "ERROR: ARM64 required"
             exit 1
           fi
 
-      - name: Validate Secrets
+      - name: Validate GitHub Secrets
         shell: bash
         env:
           ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
           ZT_TOKEN: ${{ secrets.ZEROTIER_CENTRAL_TOKEN }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          if [ -z "$ZT_NETWORK_ID" ] || [ "${#ZT_NETWORK_ID}" -ne 16 ]; then
-            echo "Invalid ZeroTier Network ID"
-            exit 1
-          fi
+          test -n "$ZT_NETWORK_ID" || exit 1
+          test -n "$ZT_TOKEN" || exit 1
 
-          if [ -z "$ZT_TOKEN" ]; then
-            echo "ZeroTier API token missing"
+          if [ "${#ZT_NETWORK_ID}" -ne 16 ]; then
+            echo "Invalid ZeroTier network ID"
             exit 1
           fi
 
           if [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "VNC password must be exactly 8 characters"
+            echo "VNC password must be 8 characters"
             exit 1
           fi
 
-          echo "Secret validation successful"
+          echo "Secrets validated"
 
       - name: Connect to ZeroTier
         uses: zerotier/github-action@v1.0.1
@@ -62,19 +56,17 @@ jobs:
           network_id: ${{ secrets.ZEROTIER_NETWORK_ID }}
           auth_token: ${{ secrets.ZEROTIER_CENTRAL_TOKEN }}
 
-      - name: Verify ZeroTier Connection
+      - name: Verify ZeroTier Network
         shell: bash
         env:
           ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
         run: |
-          echo "Checking ZeroTier connection..."
-
-          NETWORK_INFO=""
+          echo "Checking ZeroTier..."
 
           for i in {1..30}; do
-            NETWORK_INFO=$(sudo zerotier-cli -j listnetworks)
+            INFO=$(sudo zerotier-cli -j listnetworks)
 
-            STATUS=$(echo "$NETWORK_INFO" | jq -r \
+            STATUS=$(echo "$INFO" | jq -r \
               --arg id "$ZT_NETWORK_ID" \
               '.[] | select(.nwid == $id) | .status')
 
@@ -86,12 +78,11 @@ jobs:
           done
 
           if [ "$STATUS" != "OK" ]; then
-            echo "ZeroTier network connection failed"
             sudo zerotier-cli listnetworks
             exit 1
           fi
 
-          IP=$(echo "$NETWORK_INFO" | jq -r \
+          IP=$(echo "$INFO" | jq -r \
             --arg id "$ZT_NETWORK_ID" \
             '.[] | select(.nwid == $id) |
             .assignedAddresses[]?' |
@@ -99,7 +90,7 @@ jobs:
             head -n 1)
 
           if [ -z "$IP" ]; then
-            echo "No IPv4 address assigned"
+            echo "No managed IPv4 address assigned"
             exit 1
           fi
 
@@ -107,8 +98,7 @@ jobs:
 
           echo "ZEROTIER_IP=$IP" >> "$GITHUB_ENV"
 
-          echo "ZeroTier connection successful"
-          echo "Managed IP: $IP"
+          echo "ZeroTier connected: $IP"
 
       - name: Enable macOS Remote Desktop
         shell: bash
@@ -118,7 +108,7 @@ jobs:
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
           if [ ! -x "$KICKSTART" ]; then
-            echo "Apple Remote Desktop service unavailable"
+            echo "Remote Management unavailable"
             exit 1
           fi
 
@@ -141,42 +131,79 @@ jobs:
 
           echo "Remote Desktop configured"
 
+      - name: Initialize Display
+        shell: bash
+        run: |
+          echo "Preventing system sleep..."
+
+          sudo pmset -a sleep 0
+          sudo pmset -a displaysleep 0
+
+          caffeinate -dimsu &
+          echo $! > "$RUNNER_TEMP/caffeinate.pid"
+
+          sleep 5
+
+          echo "Checking graphical processes..."
+
+          pgrep -fl "WindowServer" || true
+          pgrep -fl "loginwindow" || true
+          pgrep -fl "Finder" || true
+          pgrep -fl "Dock" || true
+
+          echo "Console user:"
+          stat -f "%Su" /dev/console
+
+          echo "GUI session check:"
+          launchctl print "gui/$(id -u)" 2>&1 | head -n 20 || true
+
       - name: Check VNC Service
         shell: bash
         run: |
-          echo "Checking VNC port..."
+          echo "Checking port 5900..."
 
           for i in {1..30}; do
             if nc -z 127.0.0.1 5900; then
-              echo "VNC service is listening"
-              exit 0
+              echo "VNC port is listening"
+              break
             fi
 
             sleep 2
           done
 
-          echo "VNC port 5900 is not responding"
-          exit 1
+          if ! nc -z 127.0.0.1 5900; then
+            echo "VNC service is unavailable"
+            exit 1
+          fi
 
-      - name: Display Connection Details
+          echo "VNC service check passed"
+
+      - name: Display Connection Information
         shell: bash
         run: |
-          echo "================================"
-          echo "BULK MACOS REMOTE DESKTOP READY"
-          echo "================================"
-          echo "macOS:"
+          echo "=================================="
+          echo "BULK MACOS M1 REMOTE DESKTOP"
+          echo "=================================="
+
+          echo "macOS version:"
           sw_vers -productVersion
+
           echo "Architecture:"
           uname -m
+
           echo "ZeroTier IP:"
           echo "$ZEROTIER_IP"
-          echo "VNC Port: 5900"
-          echo "================================"
+
+          echo "VNC port:"
+          echo "5900"
+
+          echo "=================================="
           echo "Connect using Android VNC Viewer"
-          echo "================================"
+          echo "=================================="
 
       - name: Keep Desktop Running
         shell: bash
         run: |
-          echo "Your macOS session is running."
+          echo "Keeping remote session alive..."
           sleep 20400
+          
