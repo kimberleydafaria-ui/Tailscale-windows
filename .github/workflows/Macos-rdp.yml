@@ -1,5 +1,4 @@
-
-name: Bulk macOS M1 Remote Desktop
+name: Bulk macOS ZeroTier Remote Desktop
 
 on:
   workflow_dispatch:
@@ -8,22 +7,16 @@ permissions:
   contents: read
 
 jobs:
-  macos-rdp:
-    name: Start macOS M1 Desktop
+  macos-desktop:
+    name: Start macOS M1 Remote Desktop
     runs-on: macos-26
     timeout-minutes: 360
 
-    env:
-      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-
     steps:
-      - name: Verify macOS M1 Hardware
+      - name: Verify Mac Hardware
         shell: bash
         run: |
-          echo "================================"
-          echo "BULK MACOS M1 SYSTEM"
-          echo "================================"
+          echo "===== BULK MACOS DESKTOP ====="
           sw_vers
           echo "Architecture:"
           uname -m
@@ -35,55 +28,97 @@ jobs:
           df -h /
 
           if [ "$(uname -m)" != "arm64" ]; then
-            echo "ERROR: ARM64 machine required"
+            echo "ERROR: ARM64 Mac required"
             exit 1
           fi
 
       - name: Validate Secrets
         shell: bash
+        env:
+          ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
+          ZT_TOKEN: ${{ secrets.ZEROTIER_CENTRAL_TOKEN }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          if [ -z "$TS_AUTHKEY" ]; then
-            echo "ERROR: TAILSCALE_AUTHKEY is missing"
+          if [ -z "$ZT_NETWORK_ID" ] || [ "${#ZT_NETWORK_ID}" -ne 16 ]; then
+            echo "Invalid ZeroTier Network ID"
+            exit 1
+          fi
+
+          if [ -z "$ZT_TOKEN" ]; then
+            echo "ZeroTier API token missing"
             exit 1
           fi
 
           if [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: VNC_PASSWORD must be exactly 8 characters"
+            echo "VNC password must be exactly 8 characters"
             exit 1
           fi
 
-          echo "Secrets validation passed"
+          echo "Secret validation successful"
 
-      - name: Install Tailscale
+      - name: Connect to ZeroTier
+        uses: zerotier/github-action@v1.0.1
+        with:
+          network_id: ${{ secrets.ZEROTIER_NETWORK_ID }}
+          auth_token: ${{ secrets.ZEROTIER_CENTRAL_TOKEN }}
+
+      - name: Verify ZeroTier Connection
         shell: bash
+        env:
+          ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
         run: |
-          brew install tailscale
+          echo "Checking ZeroTier connection..."
 
-          sudo brew services start tailscale
-
-          echo "Waiting for Tailscale service..."
+          NETWORK_INFO=""
 
           for i in {1..30}; do
-            if sudo tailscale status >/dev/null 2>&1; then
+            NETWORK_INFO=$(sudo zerotier-cli -j listnetworks)
+
+            STATUS=$(echo "$NETWORK_INFO" | jq -r \
+              --arg id "$ZT_NETWORK_ID" \
+              '.[] | select(.nwid == $id) | .status')
+
+            if [ "$STATUS" = "OK" ]; then
               break
             fi
+
             sleep 2
           done
 
-          sudo tailscale up \
-            --auth-key="$TS_AUTHKEY" \
-            --hostname="bulk-macos-${GITHUB_RUN_ID}" \
-            --accept-dns=false
+          if [ "$STATUS" != "OK" ]; then
+            echo "ZeroTier network connection failed"
+            sudo zerotier-cli listnetworks
+            exit 1
+          fi
 
-          echo "Tailscale connected successfully"
+          IP=$(echo "$NETWORK_INFO" | jq -r \
+            --arg id "$ZT_NETWORK_ID" \
+            '.[] | select(.nwid == $id) |
+            .assignedAddresses[]?' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/' |
+            head -n 1)
+
+          if [ -z "$IP" ]; then
+            echo "No IPv4 address assigned"
+            exit 1
+          fi
+
+          IP="${IP%%/*}"
+
+          echo "ZEROTIER_IP=$IP" >> "$GITHUB_ENV"
+
+          echo "ZeroTier connection successful"
+          echo "Managed IP: $IP"
 
       - name: Enable macOS Remote Desktop
         shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
           if [ ! -x "$KICKSTART" ]; then
-            echo "ERROR: Apple Remote Desktop service not found"
+            echo "Apple Remote Desktop service unavailable"
             exit 1
           fi
 
@@ -104,29 +139,40 @@ jobs:
 
           sudo "$KICKSTART" -restart -agent
 
-          echo "Remote Desktop configuration completed"
+          echo "Remote Desktop configured"
+
+      - name: Check VNC Service
+        shell: bash
+        run: |
+          echo "Checking VNC port..."
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5900; then
+              echo "VNC service is listening"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "VNC port 5900 is not responding"
+          exit 1
 
       - name: Display Connection Details
         shell: bash
         run: |
           echo "================================"
-          echo "MACOS REMOTE DESKTOP"
+          echo "BULK MACOS REMOTE DESKTOP READY"
           echo "================================"
-
           echo "macOS:"
           sw_vers -productVersion
-
           echo "Architecture:"
           uname -m
-
-          echo "Tailscale IP:"
-          sudo tailscale ip -4
-
-          echo "VNC PORT:"
-          echo "5900"
-
+          echo "ZeroTier IP:"
+          echo "$ZEROTIER_IP"
+          echo "VNC Port: 5900"
           echo "================================"
-          echo "Use your VNC Viewer to connect"
+          echo "Connect using Android VNC Viewer"
           echo "================================"
 
       - name: Keep Desktop Running
@@ -134,4 +180,3 @@ jobs:
         run: |
           echo "Your macOS session is running."
           sleep 20400
-          
