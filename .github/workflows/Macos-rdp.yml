@@ -1,4 +1,5 @@
-name: Bulk macOS M1 ZeroTier Desktop
+
+name: Bulk Latest macOS Remote Control
 
 on:
   workflow_dispatch:
@@ -7,28 +8,31 @@ permissions:
   contents: read
 
 jobs:
-  macos-desktop:
-    name: Start macOS M1 Remote Desktop
-    runs-on: macos-26
+  macos-remote:
+    name: Latest macOS Remote Desktop
+    runs-on: macos-latest
     timeout-minutes: 360
 
     steps:
-      - name: Verify M1 Hardware
+      - name: Verify Latest macOS
         shell: bash
         run: |
           echo "===== MACOS SYSTEM ====="
           sw_vers
-          echo "Architecture: $(uname -m)"
-          echo "CPU: $(sysctl -n hw.ncpu)"
-          echo "RAM: $(sysctl -n hw.memsize)"
+          echo "Architecture:"
+          uname -m
+          echo "CPU:"
+          sysctl -n hw.ncpu
+          echo "RAM:"
+          sysctl -n hw.memsize
           df -h /
 
           if [ "$(uname -m)" != "arm64" ]; then
-            echo "ERROR: ARM64 required"
+            echo "ERROR: Apple Silicon required"
             exit 1
           fi
 
-      - name: Validate GitHub Secrets
+      - name: Validate Secrets
         shell: bash
         env:
           ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
@@ -50,18 +54,18 @@ jobs:
 
           echo "Secrets validated"
 
-      - name: Connect to ZeroTier
+      - name: Join ZeroTier Network
         uses: zerotier/github-action@v1.0.1
         with:
           network_id: ${{ secrets.ZEROTIER_NETWORK_ID }}
           auth_token: ${{ secrets.ZEROTIER_CENTRAL_TOKEN }}
 
-      - name: Verify ZeroTier Network
+      - name: Verify ZeroTier
         shell: bash
         env:
           ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
         run: |
-          echo "Checking ZeroTier..."
+          echo "Checking ZeroTier network..."
 
           for i in {1..30}; do
             INFO=$(sudo zerotier-cli -j listnetworks)
@@ -90,34 +94,51 @@ jobs:
             head -n 1)
 
           if [ -z "$IP" ]; then
-            echo "No managed IPv4 address assigned"
+            echo "No ZeroTier IPv4 address"
             exit 1
           fi
 
           IP="${IP%%/*}"
 
           echo "ZEROTIER_IP=$IP" >> "$GITHUB_ENV"
+          echo "Connected: $IP"
 
-          echo "ZeroTier connected: $IP"
-
-      - name: Enable macOS Remote Desktop
+      - name: Force Enable Remote Management
         shell: bash
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
           if [ ! -x "$KICKSTART" ]; then
-            echo "Remote Management unavailable"
+            echo "Remote Management tool unavailable"
             exit 1
           fi
+
+          echo "Activating Apple Remote Desktop..."
 
           sudo "$KICKSTART" \
             -activate \
             -configure \
             -access -on \
-            -users "$(whoami)" \
+            -privs -all \
+            -restart \
+            -agent
+
+          echo "Granting all-user access privileges..."
+
+          sudo "$KICKSTART" \
+            -configure \
+            -allowAccessFor \
+            -allUsers \
             -privs -all
+
+          echo "Remote Management configuration completed"
+
+      - name: Enable VNC Authentication
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
           sudo "$KICKSTART" \
             -configure \
@@ -129,12 +150,12 @@ jobs:
 
           sudo "$KICKSTART" -restart -agent
 
-          echo "Remote Desktop configured"
+          echo "VNC authentication configured"
 
-      - name: Initialize Display
+      - name: Initialize macOS Display
         shell: bash
         run: |
-          echo "Preventing system sleep..."
+          echo "Preventing sleep..."
 
           sudo pmset -a sleep 0
           sudo pmset -a displaysleep 0
@@ -142,50 +163,53 @@ jobs:
           caffeinate -dimsu &
           echo $! > "$RUNNER_TEMP/caffeinate.pid"
 
-          sleep 5
+          sleep 10
 
-          echo "Checking graphical processes..."
+          echo "===== DISPLAY DIAGNOSTICS ====="
 
-          pgrep -fl "WindowServer" || true
-          pgrep -fl "loginwindow" || true
-          pgrep -fl "Finder" || true
-          pgrep -fl "Dock" || true
+          echo "WindowServer:"
+          pgrep -fl WindowServer || true
 
-          echo "Console user:"
+          echo "Login Window:"
+          pgrep -fl loginwindow || true
+
+          echo "Finder:"
+          pgrep -fl Finder || true
+
+          echo "Dock:"
+          pgrep -fl Dock || true
+
+          echo "Console User:"
           stat -f "%Su" /dev/console
 
-          echo "GUI session check:"
-          launchctl print "gui/$(id -u)" 2>&1 | head -n 20 || true
+          echo "GUI Session:"
+          launchctl print "gui/$(id -u)" 2>&1 | head -n 30 || true
 
-      - name: Check VNC Service
+      - name: Restart Remote Desktop Services
         shell: bash
         run: |
-          echo "Checking port 5900..."
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 5900; then
-              echo "VNC port is listening"
-              break
-            fi
+          sudo "$KICKSTART" -restart -agent
 
-            sleep 2
-          done
+          sleep 5
 
-          if ! nc -z 127.0.0.1 5900; then
-            echo "VNC service is unavailable"
-            exit 1
+          echo "Checking VNC..."
+
+          if nc -z 127.0.0.1 5900; then
+            echo "VNC port 5900 is listening"
+          else
+            echo "WARNING: VNC port is not listening"
           fi
 
-          echo "VNC service check passed"
-
-      - name: Display Connection Information
+      - name: Display Connection Details
         shell: bash
         run: |
-          echo "=================================="
-          echo "BULK MACOS M1 REMOTE DESKTOP"
-          echo "=================================="
+          echo "================================"
+          echo "LATEST MACOS REMOTE DESKTOP"
+          echo "================================"
 
-          echo "macOS version:"
+          echo "macOS:"
           sw_vers -productVersion
 
           echo "Architecture:"
@@ -194,16 +218,16 @@ jobs:
           echo "ZeroTier IP:"
           echo "$ZEROTIER_IP"
 
-          echo "VNC port:"
+          echo "VNC PORT:"
           echo "5900"
 
-          echo "=================================="
+          echo "================================"
           echo "Connect using Android VNC Viewer"
-          echo "=================================="
+          echo "================================"
 
-      - name: Keep Desktop Running
+      - name: Keep Remote Session Alive
         shell: bash
         run: |
-          echo "Keeping remote session alive..."
+          echo "Remote session running..."
           sleep 20400
           
